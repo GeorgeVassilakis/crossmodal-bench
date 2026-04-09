@@ -61,41 +61,49 @@ def load_provabgs_data(path: str) -> dict[str, np.ndarray]:
 
 
 def generate_spectrum_tokens(
-    model,
     codec,
-    target_modality,
-    device: str,
-    decoding_steps: int,
+    sampler,
+    schedule,
+    target_domain: str,
+    target_num_tokens: int,
     *modalities,
 ) -> dict[str, torch.Tensor]:
     """Generate spectrum tokens using AION's iterative MaskGIT sampler."""
-    from aion.fourm.generate import (
-        GenerationSampler,
-        build_chained_generation_schedules,
-        init_empty_target_modality,
-        init_full_input_modality,
-    )
+    from aion.fourm.generate import init_empty_target_modality, init_full_input_modality
 
     token_dict = codec.encode(*modalities)
     mod_dict: dict[str, dict[str, torch.Tensor]] = {}
 
     for token_key, tensor in token_dict.items():
         mod_dict[token_key] = {"tensor": tensor}
-        init_full_input_modality(mod_dict, model.modality_info, token_key, device)
+        init_full_input_modality(mod_dict, sampler.model.modality_info, token_key, codec.device)
 
     init_empty_target_modality(
         mod_dict,
-        model.modality_info,
-        target_modality.token_key,
+        sampler.model.modality_info,
+        target_domain,
         batch_size=list(token_dict.values())[0].shape[0],
-        num_tokens=target_modality.num_tokens,
-        device=device,
+        num_tokens=target_num_tokens,
+        device=codec.device,
     )
 
-    schedule = build_chained_generation_schedules(
-        cond_domains=list(token_dict.keys()),
-        target_domains=[target_modality.token_key],
-        tokens_per_target=[target_modality.num_tokens],
+    generated = sampler.generate(mod_dict, schedule, verbose=False)
+    return {target_domain: generated[target_domain]["tensor"]}
+
+
+def build_maskgit_schedule(
+    model,
+    cond_domains: list[str],
+    target_domain: str,
+    target_num_tokens: int,
+    decoding_steps: int,
+):
+    from aion.fourm.generate import build_chained_generation_schedules
+
+    return build_chained_generation_schedules(
+        cond_domains=cond_domains,
+        target_domains=[target_domain],
+        tokens_per_target=[target_num_tokens],
         autoregression_schemes=["maskgit"],
         decoding_steps=[decoding_steps],
         token_decoding_schedules=["cosine"],
@@ -105,10 +113,6 @@ def generate_spectrum_tokens(
         cfg_schedules=["constant"],
         modality_info=model.modality_info,
     )
-
-    sampler = GenerationSampler(model)
-    generated = sampler.generate(mod_dict, schedule, verbose=False)
-    return {target_modality.token_key: generated[target_modality.token_key]["tensor"]}
 
 
 def run_inference(
@@ -121,6 +125,7 @@ def run_inference(
 ):
     from aion import AION
     from aion.codecs import CodecManager
+    from aion.fourm.generate import GenerationSampler
     from aion.modalities import (
         DESISpectrum,
         LegacySurveyFluxG,
@@ -134,6 +139,28 @@ def run_inference(
     print(f"Loading model: {model_name}")
     model = AION.from_pretrained(model_name).to(device).eval()
     codec = CodecManager(device=device)
+    sampler = GenerationSampler(model)
+
+    image_only_schedule = build_maskgit_schedule(
+        model=model,
+        cond_domains=[LegacySurveyImage.token_key],
+        target_domain=DESISpectrum.token_key,
+        target_num_tokens=DESISpectrum.num_tokens,
+        decoding_steps=spectrum_decoding_steps,
+    )
+    image_phot_schedule = build_maskgit_schedule(
+        model=model,
+        cond_domains=[
+            LegacySurveyImage.token_key,
+            LegacySurveyFluxG.token_key,
+            LegacySurveyFluxR.token_key,
+            LegacySurveyFluxI.token_key,
+            LegacySurveyFluxZ.token_key,
+        ],
+        target_domain=DESISpectrum.token_key,
+        target_num_tokens=DESISpectrum.num_tokens,
+        decoding_steps=spectrum_decoding_steps,
+    )
 
     images = data["images"]
     # Use wavelength from first spectrum (shared grid)
@@ -174,15 +201,15 @@ def run_inference(
         )
         with torch.no_grad():
             pred_tokens = generate_spectrum_tokens(
-                model,
                 codec,
-                DESISpectrum,
-                device,
-                spectrum_decoding_steps,
+                sampler,
+                image_only_schedule,
+                DESISpectrum.token_key,
+                DESISpectrum.num_tokens,
                 image_mod,
             )
 
-        wl = wavelength_tensor.unsqueeze(0).expand(B, -1)
+        wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
         pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
 
         pred_flux_image_only[start:end] = pred_spectrum.flux.cpu().numpy()
@@ -217,11 +244,11 @@ def run_inference(
 
         with torch.no_grad():
             pred_tokens = generate_spectrum_tokens(
-                model,
                 codec,
-                DESISpectrum,
-                device,
-                spectrum_decoding_steps,
+                sampler,
+                image_phot_schedule,
+                DESISpectrum.token_key,
+                DESISpectrum.num_tokens,
                 image_mod,
                 fg,
                 fr,
@@ -229,7 +256,7 @@ def run_inference(
                 fz,
             )
 
-        wl = wavelength_tensor.unsqueeze(0).expand(B, -1)
+        wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
         pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
 
         pred_flux_image_phot[start:end] = pred_spectrum.flux.cpu().numpy()
