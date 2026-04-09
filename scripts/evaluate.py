@@ -186,6 +186,7 @@ def stratified_summary(
 
 def evaluate_mode(
     pred_flux: np.ndarray,
+    pred_mask: np.ndarray,
     true_flux: np.ndarray,
     ivar: np.ndarray,
     spec_mask: np.ndarray,
@@ -200,7 +201,7 @@ def evaluate_mode(
     print(f"\n  === {mode_name} ===")
 
     # Combine masks: ground-truth mask + prediction mask
-    combined_mask = spec_mask
+    combined_mask = spec_mask | pred_mask
 
     # Per-wavelength chi2
     chi2_lam = per_wavelength_chi2(pred_flux, true_flux, ivar, combined_mask)
@@ -280,8 +281,26 @@ def main():
     # Load predictions
     print(f"Loading predictions from {pred_path}")
     with h5py.File(pred_path, "r") as f:
+        if "image_only_done" in f.attrs and not bool(f.attrs["image_only_done"]):
+            raise RuntimeError("Image-only predictions are incomplete; rerun inference before evaluation.")
+        if "image_phot_done" in f.attrs and not bool(f.attrs["image_phot_done"]):
+            raise RuntimeError("Image+phot predictions are incomplete; rerun inference before evaluation.")
+
         pred_image_only = f["pred_flux_image_only"][:]
         pred_image_phot = f["pred_flux_image_phot"][:]
+        if "pred_mask_image_only" in f:
+            pred_mask_image_only = f["pred_mask_image_only"][:].astype(bool)
+        elif "pred_mask" in f:
+            pred_mask_image_only = f["pred_mask"][:].astype(bool)
+        else:
+            pred_mask_image_only = np.zeros_like(spec_mask, dtype=bool)
+
+        if "pred_mask_image_phot" in f:
+            pred_mask_image_phot = f["pred_mask_image_phot"][:].astype(bool)
+        elif "pred_mask" in f:
+            pred_mask_image_phot = f["pred_mask"][:].astype(bool)
+        else:
+            pred_mask_image_phot = np.zeros_like(spec_mask, dtype=bool)
 
     # Stratify by redshift bin (provabgs data is all BGS)
     strata = classify_redshift_bin(z_spec)
@@ -295,13 +314,13 @@ def main():
     chi2_threshold = cfg.get("chi2_good_threshold", 3.0)
 
     results_image = evaluate_mode(
-        pred_image_only, true_flux, ivar, spec_mask,
+        pred_image_only, pred_mask_image_only, true_flux, ivar, spec_mask,
         wavelength, z_spec, strata,
         "Image Only", poly_degree, chi2_threshold,
     )
 
     results_phot = evaluate_mode(
-        pred_image_phot, true_flux, ivar, spec_mask,
+        pred_image_phot, pred_mask_image_phot, true_flux, ivar, spec_mask,
         wavelength, z_spec, strata,
         "Image + Photometry", poly_degree, chi2_threshold,
     )

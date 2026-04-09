@@ -115,6 +115,110 @@ def build_maskgit_schedule(
     )
 
 
+def make_batched_scalar(values: np.ndarray, start: int, end: int, device: str) -> torch.Tensor:
+    """Return scalar conditioning values with explicit [batch, 1] shape."""
+    return torch.tensor(
+        values[start:end], dtype=torch.float32, device=device
+    ).reshape(-1, 1)
+
+
+def save_ground_truth(
+    data: dict[str, np.ndarray],
+    gt_path: str,
+    wavelength: np.ndarray,
+) -> None:
+    """Write ground truth once so evaluation can proceed independently of inference restarts."""
+    if os.path.exists(gt_path):
+        return
+
+    os.makedirs(os.path.dirname(gt_path), exist_ok=True)
+    print(f"Saving ground truth to {gt_path}")
+    with h5py.File(gt_path, "w") as f:
+        f.create_dataset("spectrum_flux", data=data["spectrum_flux"])
+        f.create_dataset("spectrum_ivar", data=data["spectrum_ivar"])
+        f.create_dataset("spectrum_mask", data=data["spectrum_mask"])
+        f.create_dataset("spectrum_lambda", data=wavelength)
+        f.create_dataset("z_spec", data=data["z_spec"])
+        if "image_rgb" in data:
+            f.create_dataset("image_rgb", data=data["image_rgb"])
+        f.create_dataset("images", data=data["images"], compression="gzip", compression_opts=1)
+        f.create_dataset("flux_g", data=data["flux_g"])
+        f.create_dataset("flux_r", data=data["flux_r"])
+        f.create_dataset("flux_i", data=data["flux_i"])
+        f.create_dataset("flux_z", data=data["flux_z"])
+
+
+def prepare_prediction_store(
+    output_path: str,
+    model_name: str,
+    wavelength: np.ndarray,
+    n_objects: int,
+    n_wavelength: int,
+    spectrum_decoding_steps: int,
+) -> h5py.File:
+    """Open a checkpointable predictions store, creating datasets if needed."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    f = h5py.File(output_path, "a")
+
+    expected_shape = (n_objects, n_wavelength)
+
+    def ensure_prediction_dataset(name: str, dtype: np.dtype) -> None:
+        if name not in f:
+            f.create_dataset(name, shape=expected_shape, dtype=dtype)
+            return
+        if f[name].shape != expected_shape:
+            raise ValueError(
+                f"Existing dataset {name} has shape {f[name].shape}, expected {expected_shape}. "
+                f"Use a different --output path or remove the stale predictions file."
+            )
+
+    for name, dtype in [
+        ("pred_flux_image_only", np.float32),
+        ("pred_flux_image_phot", np.float32),
+        ("pred_mask_image_only", np.bool_),
+        ("pred_mask_image_phot", np.bool_),
+        ("pred_mask", np.bool_),
+    ]:
+        ensure_prediction_dataset(name, dtype)
+
+    if "wavelength" not in f:
+        f.create_dataset("wavelength", data=wavelength)
+    elif f["wavelength"].shape != wavelength.shape or not np.array_equal(f["wavelength"][:], wavelength):
+        raise ValueError(
+            "Existing predictions file has a different wavelength grid. "
+            "Use a different --output path or remove the stale predictions file."
+        )
+
+    existing_model_name = f.attrs.get("model_name")
+    if existing_model_name not in (None, model_name):
+        raise ValueError(
+            f"Existing predictions file was created for model {existing_model_name!r}, "
+            f"but current run uses {model_name!r}."
+        )
+
+    existing_steps = f.attrs.get("spectrum_decoding_steps")
+    if existing_steps not in (None, spectrum_decoding_steps):
+        raise ValueError(
+            f"Existing predictions file was created with spectrum_decoding_steps={existing_steps}, "
+            f"but current run uses {spectrum_decoding_steps}."
+        )
+
+    f.attrs["model_name"] = model_name
+    f.attrs["n_objects"] = n_objects
+    f.attrs["n_wavelength"] = n_wavelength
+    f.attrs["spectrum_decoding_steps"] = spectrum_decoding_steps
+    if "image_only_next_index" not in f.attrs:
+        f.attrs["image_only_next_index"] = 0
+    if "image_phot_next_index" not in f.attrs:
+        f.attrs["image_phot_next_index"] = 0
+    if "image_only_done" not in f.attrs:
+        f.attrs["image_only_done"] = False
+    if "image_phot_done" not in f.attrs:
+        f.attrs["image_phot_done"] = False
+    f.flush()
+    return f
+
+
 def run_inference(
     data: dict[str, np.ndarray],
     output_path: str,
@@ -171,128 +275,138 @@ def run_inference(
     N = images.shape[0]
     n_wave = len(wavelength)
     wavelength_tensor = torch.tensor(wavelength, dtype=torch.float32, device=device)
+    gt_path = output_path.replace("predictions", "ground_truth")
+
+    save_ground_truth(data, gt_path, wavelength)
+    pred_store = prepare_prediction_store(
+        output_path=output_path,
+        model_name=model_name,
+        wavelength=wavelength,
+        n_objects=N,
+        n_wavelength=n_wave,
+        spectrum_decoding_steps=spectrum_decoding_steps,
+    )
 
     print(f"Running inference on {N} galaxies, batch_size={batch_size}")
     print(f"Spectrum decoding: MaskGIT, {spectrum_decoding_steps} steps")
 
-    # Pre-allocate output arrays
-    pred_flux_image_only = np.zeros((N, n_wave), dtype=np.float32)
-    pred_flux_image_phot = np.zeros((N, n_wave), dtype=np.float32)
-    pred_mask = np.zeros((N, n_wave), dtype=bool)
-
     # ---------- Mode 1: Image only ----------
-    print("\n--- Mode 1: Image only ---")
-    t0 = time.time()
+    image_only_done = bool(pred_store.attrs["image_only_done"])
+    image_only_start = int(pred_store.attrs["image_only_next_index"])
+    if image_only_done:
+        print("\n--- Mode 1: Image only ---")
+        print("  Checkpoint complete, skipping.")
+    else:
+        print("\n--- Mode 1: Image only ---")
+        if image_only_start > 0:
+            print(f"  Resuming from object {image_only_start}/{N}")
+        t0 = time.time()
 
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        B = end - start
+        for start in range(image_only_start, N, batch_size):
+            end = min(start + batch_size, N)
+            B = end - start
 
-        if start % (batch_size * 10) == 0:
-            print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
+            if start % (batch_size * 10) == 0:
+                print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
 
-        batch_images = torch.tensor(
-            images[start:end], dtype=torch.float32, device=device
-        )
-
-        image_mod = LegacySurveyImage(
-            flux=batch_images,
-            bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
-        )
-        with torch.no_grad():
-            pred_tokens = generate_spectrum_tokens(
-                codec,
-                sampler,
-                image_only_schedule,
-                DESISpectrum.token_key,
-                DESISpectrum.num_tokens,
-                image_mod,
+            batch_images = torch.tensor(
+                images[start:end], dtype=torch.float32, device=device
             )
 
-        wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
-        pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
+            image_mod = LegacySurveyImage(
+                flux=batch_images,
+                bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
+            )
+            with torch.no_grad():
+                pred_tokens = generate_spectrum_tokens(
+                    codec,
+                    sampler,
+                    image_only_schedule,
+                    DESISpectrum.token_key,
+                    DESISpectrum.num_tokens,
+                    image_mod,
+                )
 
-        pred_flux_image_only[start:end] = pred_spectrum.flux.cpu().numpy()
-        pred_mask[start:end] = pred_spectrum.mask.cpu().numpy()
+            wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
+            pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
+            pred_flux = pred_spectrum.flux.cpu().numpy()
+            pred_mask = pred_spectrum.mask.cpu().numpy()
 
-    t1 = time.time()
-    print(f"  Image-only inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
+            pred_store["pred_flux_image_only"][start:end] = pred_flux
+            pred_store["pred_mask_image_only"][start:end] = pred_mask
+            pred_store["pred_mask"][start:end] = pred_mask
+            pred_store.attrs["image_only_next_index"] = end
+            pred_store.flush()
+
+        pred_store.attrs["image_only_next_index"] = N
+        pred_store.attrs["image_only_done"] = True
+        pred_store.flush()
+        t1 = time.time()
+        print(f"  Image-only inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
 
     # ---------- Mode 2: Image + photometry ----------
-    print("\n--- Mode 2: Image + photometry ---")
-    t0 = time.time()
+    image_phot_done = bool(pred_store.attrs["image_phot_done"])
+    image_phot_start = int(pred_store.attrs["image_phot_next_index"])
+    if image_phot_done:
+        print("\n--- Mode 2: Image + photometry ---")
+        print("  Checkpoint complete, skipping.")
+    else:
+        print("\n--- Mode 2: Image + photometry ---")
+        if image_phot_start > 0:
+            print(f"  Resuming from object {image_phot_start}/{N}")
+        t0 = time.time()
 
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        B = end - start
+        for start in range(image_phot_start, N, batch_size):
+            end = min(start + batch_size, N)
+            B = end - start
 
-        if start % (batch_size * 10) == 0:
-            print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
+            if start % (batch_size * 10) == 0:
+                print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
 
-        batch_images = torch.tensor(
-            images[start:end], dtype=torch.float32, device=device
-        )
-
-        image_mod = LegacySurveyImage(
-            flux=batch_images,
-            bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
-        )
-        fg = LegacySurveyFluxG(value=torch.tensor(data["flux_g"][start:end], dtype=torch.float32, device=device))
-        fr = LegacySurveyFluxR(value=torch.tensor(data["flux_r"][start:end], dtype=torch.float32, device=device))
-        fi = LegacySurveyFluxI(value=torch.tensor(data["flux_i"][start:end], dtype=torch.float32, device=device))
-        fz = LegacySurveyFluxZ(value=torch.tensor(data["flux_z"][start:end], dtype=torch.float32, device=device))
-
-        with torch.no_grad():
-            pred_tokens = generate_spectrum_tokens(
-                codec,
-                sampler,
-                image_phot_schedule,
-                DESISpectrum.token_key,
-                DESISpectrum.num_tokens,
-                image_mod,
-                fg,
-                fr,
-                fi,
-                fz,
+            batch_images = torch.tensor(
+                images[start:end], dtype=torch.float32, device=device
             )
 
-        wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
-        pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
+            image_mod = LegacySurveyImage(
+                flux=batch_images,
+                bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
+            )
+            fg = LegacySurveyFluxG(value=make_batched_scalar(data["flux_g"], start, end, device))
+            fr = LegacySurveyFluxR(value=make_batched_scalar(data["flux_r"], start, end, device))
+            fi = LegacySurveyFluxI(value=make_batched_scalar(data["flux_i"], start, end, device))
+            fz = LegacySurveyFluxZ(value=make_batched_scalar(data["flux_z"], start, end, device))
 
-        pred_flux_image_phot[start:end] = pred_spectrum.flux.cpu().numpy()
+            with torch.no_grad():
+                pred_tokens = generate_spectrum_tokens(
+                    codec,
+                    sampler,
+                    image_phot_schedule,
+                    DESISpectrum.token_key,
+                    DESISpectrum.num_tokens,
+                    image_mod,
+                    fg,
+                    fr,
+                    fi,
+                    fz,
+                )
 
-    t1 = time.time()
-    print(f"  Image+phot inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
+            wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
+            pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
+            pred_flux = pred_spectrum.flux.cpu().numpy()
+            pred_mask = pred_spectrum.mask.cpu().numpy()
 
-    # ---------- Save predictions ----------
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    print(f"\nSaving predictions to {output_path}")
-    with h5py.File(output_path, "w") as f:
-        f.create_dataset("pred_flux_image_only", data=pred_flux_image_only)
-        f.create_dataset("pred_flux_image_phot", data=pred_flux_image_phot)
-        f.create_dataset("pred_mask", data=pred_mask)
-        f.create_dataset("wavelength", data=wavelength)
-        f.attrs["model_name"] = model_name
-        f.attrs["n_objects"] = N
-        f.attrs["n_wavelength"] = n_wave
+            pred_store["pred_flux_image_phot"][start:end] = pred_flux
+            pred_store["pred_mask_image_phot"][start:end] = pred_mask
+            pred_store.attrs["image_phot_next_index"] = end
+            pred_store.flush()
 
-    # Also save ground truth alongside for convenience
-    gt_path = output_path.replace("predictions", "ground_truth")
-    print(f"Saving ground truth to {gt_path}")
-    with h5py.File(gt_path, "w") as f:
-        f.create_dataset("spectrum_flux", data=data["spectrum_flux"])
-        f.create_dataset("spectrum_ivar", data=data["spectrum_ivar"])
-        f.create_dataset("spectrum_mask", data=data["spectrum_mask"])
-        f.create_dataset("spectrum_lambda", data=wavelength)
-        f.create_dataset("z_spec", data=data["z_spec"])
-        if "image_rgb" in data:
-            f.create_dataset("image_rgb", data=data["image_rgb"])
-        f.create_dataset("images", data=images, compression="gzip", compression_opts=1)
-        f.create_dataset("flux_g", data=data["flux_g"])
-        f.create_dataset("flux_r", data=data["flux_r"])
-        f.create_dataset("flux_i", data=data["flux_i"])
-        f.create_dataset("flux_z", data=data["flux_z"])
+        pred_store.attrs["image_phot_next_index"] = N
+        pred_store.attrs["image_phot_done"] = True
+        pred_store.flush()
+        t1 = time.time()
+        print(f"  Image+phot inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
 
+    pred_store.close()
     print("Done.")
 
 
