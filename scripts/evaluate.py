@@ -31,6 +31,160 @@ REST_FRAME_LINES = {
     "SII_6731": 6731,
 }
 LINE_MASK_HALFWIDTH_A = 15.0  # mask +/- this many Angstrom around each line
+CAMERA_BOUNDARIES_A = [4500, 5900, 7500]
+
+
+def save_summary_plots(
+    output_dir: str,
+    wavelength: np.ndarray,
+    z_spec: np.ndarray,
+    spec_mask: np.ndarray,
+    ivar: np.ndarray,
+    true_flux: np.ndarray,
+    pred_image_only: np.ndarray,
+    pred_image_phot: np.ndarray,
+    per_obj: pd.DataFrame,
+    results_image: dict,
+    results_phot: dict,
+) -> None:
+    """Write a compact set of static plots alongside the scalar metrics."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({
+        "figure.dpi": 120,
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+    })
+
+    wav = wavelength
+
+    # Plot 1: Per-wavelength chi2 and normalized residual bias
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+    ax1.plot(wav, results_image["chi2_per_wavelength"], color="steelblue", lw=0.7, label="Image only")
+    ax1.plot(wav, results_phot["chi2_per_wavelength"], color="darkorange", lw=0.7, label="Image+phot")
+    ax1.axhline(1.0, color="black", ls="--", lw=0.5, alpha=0.5)
+    for boundary in CAMERA_BOUNDARIES_A:
+        ax1.axvline(boundary, color="gray", ls=":", lw=0.5, alpha=0.5)
+    ax1.set_ylabel("Mean reduced chi2")
+    ax1.set_yscale("log")
+    ax1.legend()
+    ax1.set_title("Per-Wavelength Reduced Chi-Squared")
+
+    ax2.plot(
+        wav,
+        results_image["residuals"]["mean_norm_residual"],
+        color="steelblue",
+        lw=0.5,
+        alpha=0.8,
+        label="Image only",
+    )
+    ax2.plot(
+        wav,
+        results_phot["residuals"]["mean_norm_residual"],
+        color="darkorange",
+        lw=0.5,
+        alpha=0.8,
+        label="Image+phot",
+    )
+    ax2.axhline(0, color="black", ls="--", lw=0.5)
+    for boundary in CAMERA_BOUNDARIES_A:
+        ax2.axvline(boundary, color="gray", ls=":", lw=0.5, alpha=0.5)
+    ax2.set_ylabel("Mean norm. residual")
+    ax2.set_xlabel("Wavelength [A]")
+    ax2.set_title("Systematic Bias")
+    ax2.set_xlim(float(wav[0]), float(wav[-1]))
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "chi2_per_wavelength.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Plot 2: Per-object chi2 histograms by redshift bin
+    z_bin_list = sorted(set(per_obj["z_bin"].values))
+    n_bins = len(z_bin_list)
+    fig, axes = plt.subplots(1, n_bins, figsize=(4 * n_bins, 3.5), sharey=True)
+    if n_bins == 1:
+        axes = [axes]
+
+    bins = np.logspace(-1, 2.5, 50)
+    for ax, zbin in zip(axes, z_bin_list):
+        mask = per_obj["z_bin"] == zbin
+        chi2_img = per_obj.loc[mask, "chi2_image_only"].dropna()
+        chi2_phot = per_obj.loc[mask, "chi2_image_phot"].dropna()
+
+        ax.hist(chi2_img, bins=bins, alpha=0.5, color="steelblue", label="Image only")
+        ax.hist(chi2_phot, bins=bins, alpha=0.5, color="darkorange", label="Image+phot")
+        ax.axvline(3.0, color="black", ls="--", lw=0.8, alpha=0.6)
+        ax.set_xscale("log")
+        ax.set_xlabel("Reduced chi2")
+        ax.set_title(f"{zbin} (n={int(mask.sum())})")
+        if ax == axes[0]:
+            ax.set_ylabel("Count")
+            ax.legend(fontsize=7)
+
+    plt.suptitle("Per-Object Reduced Chi-Squared Distribution", y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "chi2_histogram.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Plot 3: Improvement from adding photometry
+    fig, ax = plt.subplots(figsize=(7, 5))
+    delta_chi2 = per_obj["chi2_image_only"] - per_obj["chi2_image_phot"]
+    scatter = ax.scatter(
+        per_obj["z_spec"],
+        delta_chi2,
+        c=per_obj["chi2_image_only"],
+        s=10,
+        alpha=0.35,
+        cmap="viridis",
+        edgecolors="none",
+    )
+    ax.axhline(0, color="black", ls="--", lw=0.8)
+    ax.set_xlabel("Spectroscopic redshift")
+    ax.set_ylabel("Delta chi2 (image-only minus image+phot)")
+    ax.set_title("Photometry Gain Across Redshift")
+    cbar = plt.colorbar(scatter, ax=ax, shrink=0.85)
+    cbar.set_label("Image-only chi2")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "chi2_gain_vs_redshift.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Plot 4: Residual heatmap for image-only predictions
+    sort_idx = np.argsort(z_spec)
+    valid = ~spec_mask & (ivar > 0)
+    norm_resid = (pred_image_only - true_flux) * np.sqrt(np.where(valid, ivar, 0))
+    norm_resid[~valid] = np.nan
+
+    step = max(1, len(sort_idx) // 500)
+    display_idx = sort_idx[::step]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(
+        norm_resid[display_idx],
+        aspect="auto",
+        cmap="RdBu_r",
+        vmin=-3,
+        vmax=3,
+        extent=[wav[0], wav[-1], z_spec[display_idx[-1]], z_spec[display_idx[0]]],
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Wavelength [A]")
+    ax.set_ylabel("Redshift")
+    ax.set_title("Normalized Residual Heatmap (Image Only)")
+    plt.colorbar(im, ax=ax, label="Normalized residual", shrink=0.8)
+
+    for line_rest in REST_FRAME_LINES.values():
+        z_range = np.linspace(z_spec[display_idx[0]], z_spec[display_idx[-1]], 100)
+        obs_wav = line_rest * (1 + z_range)
+        in_range = (obs_wav > wav[0]) & (obs_wav < wav[-1])
+        ax.plot(obs_wav[in_range], z_range[in_range], "k--", lw=0.5, alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "residual_heatmap_image_only.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def make_line_mask(wavelength: np.ndarray, z_spec: np.ndarray) -> np.ndarray:
@@ -375,6 +529,21 @@ def main():
         mean_norm_residual_image_phot=results_phot["residuals"]["mean_norm_residual"],
     )
     print(f"Saved per-wavelength arrays to {output_dir}/per_wavelength.npz")
+
+    save_summary_plots(
+        output_dir=output_dir,
+        wavelength=wavelength,
+        z_spec=z_spec,
+        spec_mask=spec_mask,
+        ivar=ivar,
+        true_flux=true_flux,
+        pred_image_only=pred_image_only,
+        pred_image_phot=pred_image_phot,
+        per_obj=per_obj,
+        results_image=results_image,
+        results_phot=results_phot,
+    )
+    print(f"Saved summary plots to {output_dir}")
 
 
 if __name__ == "__main__":
