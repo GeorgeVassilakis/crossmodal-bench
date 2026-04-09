@@ -1,32 +1,6 @@
-# Cluster data paths (Flatiron)
-desi_zcatalog: /mnt/ceph/users/polymathic/external_data/astro/DESI_DR1/zall-pix-iron.fits
-desi_coadd_root: /mnt/ceph/users/polymathic/external_data/astro/DESI_DR1
-legacy_root: /mnt/ceph/users/polymathic/MultimodalUniverse/legacysurvey/dr10_south_21
-
-# Evaluation dataset
-n_eval: 5000
-match_radius_arcsec: 1.0
-healpix_nside: 16
-random_seed: 42
-
-# DESI selection
-desi_survey: main
-desi_spectype: GALAXY
-desi_zwarn_max: 0
-desi_deltachi2_min: 25.0
-
-# Stratification (by PROGRAM + redshift)
-strata:
-  BGS:
-    program: bright
-  LRG:
-    program: dark
-    z_max: 0.5
-  ELG:
-    program: dark
-    z_min: 0.5
-  QSO:
-    spectype: QSO
+# Data
+data_url: https://users.flatironinstitute.org/~polymathic/data/provabgs_desi_ls.hdf5
+data_file: data/provabgs_desi_ls.hdf5
 
 # Model
 model_name: polymathic-ai/aion-base

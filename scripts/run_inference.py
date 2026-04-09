@@ -1,7 +1,7 @@
 """Run AION-1 cross-modal inference: predict DESI spectra from Legacy Survey images.
 
-Reads data/eval_dataset.hdf5, runs inference in two modes (image-only and
-image+photometry), and saves predictions to artifacts/predictions.hdf5.
+Reads data/provabgs_desi_ls.hdf5 (or custom eval HDF5), runs inference in two
+modes (image-only and image+photometry), saves predictions to artifacts/predictions.hdf5.
 """
 
 from __future__ import annotations
@@ -16,8 +16,39 @@ import torch
 import yaml
 
 
+def load_provabgs_data(path: str) -> dict[str, np.ndarray]:
+    """Load the provabgs_desi_ls.hdf5 file and return arrays in a standard format."""
+    with h5py.File(path, "r") as f:
+        keys = list(f.keys())
+        print(f"  HDF5 keys: {keys}")
+
+        data = {
+            "images": np.array(f["legacysurvey_image_flux"]),
+            "spectrum_flux": np.array(f["desi_spectrum_flux"]),
+            "spectrum_ivar": np.array(f["desi_spectrum_ivar"]),
+            "spectrum_mask": np.array(f["desi_spectrum_mask"]).astype(bool),
+            "spectrum_lambda": np.array(f["desi_spectrum_lambda"]),
+            "flux_g": np.array(f["legacysurvey_FLUX_G"]),
+            "flux_r": np.array(f["legacysurvey_FLUX_R"]),
+            "flux_i": np.array(f["legacysurvey_FLUX_I"]),
+            "flux_z": np.array(f["legacysurvey_FLUX_Z"]),
+            "z_spec": np.array(f["provabgs_Z_HP"]),
+        }
+
+        # RGB images for visualization (if present)
+        if "legacysurvey_image_rgb" in f:
+            data["image_rgb"] = np.array(f["legacysurvey_image_rgb"])
+
+    print(f"  Loaded {data['images'].shape[0]} galaxies")
+    print(f"  Image shape: {data['images'].shape}")
+    print(f"  Spectrum shape: {data['spectrum_flux'].shape}")
+    print(f"  Wavelength range: {data['spectrum_lambda'].min():.0f} - {data['spectrum_lambda'].max():.0f} A")
+
+    return data
+
+
 def run_inference(
-    eval_path: str,
+    data: dict[str, np.ndarray],
     output_path: str,
     model_name: str = "polymathic-ai/aion-base",
     batch_size: int = 32,
@@ -39,15 +70,11 @@ def run_inference(
     model = AION.from_pretrained(model_name, trust_remote_code=True).to(device).eval()
     codec = CodecManager(device=device)
 
-    # Load evaluation dataset
-    print(f"Loading eval dataset: {eval_path}")
-    with h5py.File(eval_path, "r") as f:
-        images = f["image"][:]  # [N, 4, 160, 160]
-        wavelength = f["spectrum_lambda"][:]  # [7781]
-        flux_g_arr = f["flux_g"][:]
-        flux_r_arr = f["flux_r"][:]
-        flux_i_arr = f["flux_i"][:]
-        flux_z_arr = f["flux_z"][:]
+    images = data["images"]
+    # Use wavelength from first spectrum (shared grid)
+    wavelength = data["spectrum_lambda"]
+    if wavelength.ndim == 2:
+        wavelength = wavelength[0]  # all rows share the same grid
 
     N = images.shape[0]
     n_wave = len(wavelength)
@@ -69,20 +96,18 @@ def run_inference(
         B = end - start
 
         if start % (batch_size * 10) == 0:
-            print(f"  Batch {start//batch_size + 1}/{(N + batch_size - 1)//batch_size}")
+            print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
 
         batch_images = torch.tensor(
             images[start:end], dtype=torch.float32, device=device
         )
 
-        # Encode image
         image_mod = LegacySurveyImage(
             flux=batch_images,
             bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
         )
         tokens = codec.encode(image_mod)
 
-        # Predict spectrum
         with torch.no_grad():
             logits = model(tokens, target_modality=DESISpectrum)
 
@@ -90,17 +115,14 @@ def run_inference(
             "tok_spectrum_desi": logits["tok_spectrum_desi"].argmax(dim=-1)
         }
 
-        # Decode to flux on the DESI wavelength grid
         wl = wavelength_tensor.unsqueeze(0).expand(B, -1)
         pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
 
         pred_flux_image_only[start:end] = pred_spectrum.flux.cpu().numpy()
-        if start == 0:
-            # Save mask from first batch (should be same for all via codec)
-            pred_mask[start:end] = pred_spectrum.mask.cpu().numpy()
+        pred_mask[start:end] = pred_spectrum.mask.cpu().numpy()
 
     t1 = time.time()
-    print(f"  Image-only inference: {t1 - t0:.1f}s ({(t1-t0)/N*1000:.1f}ms/galaxy)")
+    print(f"  Image-only inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
 
     # ---------- Mode 2: Image + photometry ----------
     print("\n--- Mode 2: Image + photometry ---")
@@ -111,25 +133,23 @@ def run_inference(
         B = end - start
 
         if start % (batch_size * 10) == 0:
-            print(f"  Batch {start//batch_size + 1}/{(N + batch_size - 1)//batch_size}")
+            print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
 
         batch_images = torch.tensor(
             images[start:end], dtype=torch.float32, device=device
         )
 
-        # Encode image + photometry
         image_mod = LegacySurveyImage(
             flux=batch_images,
             bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
         )
-        fg = LegacySurveyFluxG(value=torch.tensor(flux_g_arr[start:end], dtype=torch.float32, device=device))
-        fr = LegacySurveyFluxR(value=torch.tensor(flux_r_arr[start:end], dtype=torch.float32, device=device))
-        fi = LegacySurveyFluxI(value=torch.tensor(flux_i_arr[start:end], dtype=torch.float32, device=device))
-        fz = LegacySurveyFluxZ(value=torch.tensor(flux_z_arr[start:end], dtype=torch.float32, device=device))
+        fg = LegacySurveyFluxG(value=torch.tensor(data["flux_g"][start:end], dtype=torch.float32, device=device))
+        fr = LegacySurveyFluxR(value=torch.tensor(data["flux_r"][start:end], dtype=torch.float32, device=device))
+        fi = LegacySurveyFluxI(value=torch.tensor(data["flux_i"][start:end], dtype=torch.float32, device=device))
+        fz = LegacySurveyFluxZ(value=torch.tensor(data["flux_z"][start:end], dtype=torch.float32, device=device))
 
         tokens = codec.encode(image_mod, fg, fr, fi, fz)
 
-        # Predict spectrum
         with torch.no_grad():
             logits = model(tokens, target_modality=DESISpectrum)
 
@@ -143,7 +163,7 @@ def run_inference(
         pred_flux_image_phot[start:end] = pred_spectrum.flux.cpu().numpy()
 
     t1 = time.time()
-    print(f"  Image+phot inference: {t1 - t0:.1f}s ({(t1-t0)/N*1000:.1f}ms/galaxy)")
+    print(f"  Image+phot inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
 
     # ---------- Save predictions ----------
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -157,6 +177,23 @@ def run_inference(
         f.attrs["n_objects"] = N
         f.attrs["n_wavelength"] = n_wave
 
+    # Also save ground truth alongside for convenience
+    gt_path = output_path.replace("predictions", "ground_truth")
+    print(f"Saving ground truth to {gt_path}")
+    with h5py.File(gt_path, "w") as f:
+        f.create_dataset("spectrum_flux", data=data["spectrum_flux"])
+        f.create_dataset("spectrum_ivar", data=data["spectrum_ivar"])
+        f.create_dataset("spectrum_mask", data=data["spectrum_mask"])
+        f.create_dataset("spectrum_lambda", data=wavelength)
+        f.create_dataset("z_spec", data=data["z_spec"])
+        if "image_rgb" in data:
+            f.create_dataset("image_rgb", data=data["image_rgb"])
+        f.create_dataset("images", data=images, compression="gzip", compression_opts=1)
+        f.create_dataset("flux_g", data=data["flux_g"])
+        f.create_dataset("flux_r", data=data["flux_r"])
+        f.create_dataset("flux_i", data=data["flux_i"])
+        f.create_dataset("flux_z", data=data["flux_z"])
+
     print("Done.")
 
 
@@ -166,7 +203,8 @@ def main():
         "--config", default="configs/default.yaml", help="Path to config YAML"
     )
     parser.add_argument(
-        "--eval-dataset", default="data/eval_dataset.hdf5", help="Input eval HDF5"
+        "--data", default="data/provabgs_desi_ls.hdf5",
+        help="Input HDF5 (provabgs_desi_ls.hdf5 or custom eval dataset)",
     )
     parser.add_argument(
         "--output", default="artifacts/predictions.hdf5", help="Output predictions HDF5"
@@ -180,11 +218,14 @@ def main():
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    eval_path = os.path.join(repo_root, args.eval_dataset)
+    data_path = os.path.join(repo_root, args.data)
     output_path = os.path.join(repo_root, args.output)
 
+    print(f"Loading data from {data_path}")
+    data = load_provabgs_data(data_path)
+
     run_inference(
-        eval_path=eval_path,
+        data=data,
         output_path=output_path,
         model_name=cfg.get("model_name", "polymathic-ai/aion-base"),
         batch_size=cfg.get("batch_size", 32),

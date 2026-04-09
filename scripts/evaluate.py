@@ -1,6 +1,6 @@
 """Compute Tier 1 spectral fidelity metrics.
 
-Reads data/eval_dataset.hdf5 (ground truth) and artifacts/predictions.hdf5,
+Reads artifacts/ground_truth.hdf5 and artifacts/predictions.hdf5,
 produces artifacts/metrics.json and artifacts/metrics_per_object.parquet.
 """
 
@@ -13,6 +13,7 @@ import os
 import h5py
 import numpy as np
 import pandas as pd
+import yaml
 
 
 # Common rest-frame emission/absorption lines to mask for continuum fitting (Angstrom)
@@ -137,19 +138,31 @@ def residual_analysis(
     }
 
 
+def classify_redshift_bin(z_spec: np.ndarray) -> np.ndarray:
+    """Assign galaxies to redshift bins for stratification."""
+    bins = np.empty(len(z_spec), dtype="U10")
+    bins[z_spec < 0.1] = "z<0.1"
+    bins[(z_spec >= 0.1) & (z_spec < 0.2)] = "0.1<z<0.2"
+    bins[(z_spec >= 0.2) & (z_spec < 0.3)] = "0.2<z<0.3"
+    bins[(z_spec >= 0.3) & (z_spec < 0.5)] = "0.3<z<0.5"
+    bins[z_spec >= 0.5] = "z>0.5"
+    return bins
+
+
 def stratified_summary(
     chi2_per_obj: np.ndarray,
     cont_r2: np.ndarray,
-    target_types: np.ndarray,
+    strata: np.ndarray,
     chi2_threshold: float = 3.0,
 ) -> pd.DataFrame:
-    """Summary table of metrics per target type."""
+    """Summary table of metrics per stratum (redshift bin or target type)."""
+    unique_strata = sorted(set(strata))
     rows = []
-    for ttype in ["BGS", "LRG", "ELG", "QSO", "ALL"]:
-        if ttype == "ALL":
+    for label in list(unique_strata) + ["ALL"]:
+        if label == "ALL":
             mask = np.ones(len(chi2_per_obj), dtype=bool)
         else:
-            mask = target_types == ttype
+            mask = strata == label
 
         n = mask.sum()
         if n == 0:
@@ -159,7 +172,7 @@ def stratified_summary(
         r2_vals = cont_r2[mask]
 
         rows.append({
-            "target_type": ttype,
+            "stratum": label,
             "n_objects": int(n),
             "median_chi2": float(np.nanmedian(chi2_vals)),
             "mean_chi2": float(np.nanmean(chi2_vals)),
@@ -178,7 +191,7 @@ def evaluate_mode(
     spec_mask: np.ndarray,
     wavelength: np.ndarray,
     z_spec: np.ndarray,
-    target_types: np.ndarray,
+    strata: np.ndarray,
     mode_name: str,
     poly_degree: int = 7,
     chi2_threshold: float = 3.0,
@@ -200,23 +213,23 @@ def evaluate_mode(
 
     # Continuum R2
     print("  Computing continuum R2...")
-    cont_r2 = continuum_r2(
+    cont_r2_vals = continuum_r2(
         pred_flux, true_flux, wavelength, combined_mask, z_spec, poly_degree
     )
-    print(f"  Median continuum R2: {np.nanmedian(cont_r2):.3f}")
+    print(f"  Median continuum R2: {np.nanmedian(cont_r2_vals):.3f}")
 
     # Residual analysis
     residuals = residual_analysis(pred_flux, true_flux, ivar, combined_mask)
     print(f"  Mean normalized residual (bias): {np.nanmean(residuals['mean_norm_residual']):.4f}")
 
     # Stratified summary
-    summary = stratified_summary(chi2_obj, cont_r2, target_types, chi2_threshold)
+    summary = stratified_summary(chi2_obj, cont_r2_vals, strata, chi2_threshold)
     print(f"\n  Stratified summary:\n{summary.to_string(index=False)}")
 
     return {
         "chi2_per_wavelength": chi2_lam,
         "chi2_per_object": chi2_obj,
-        "continuum_r2": cont_r2,
+        "continuum_r2": cont_r2_vals,
         "residuals": residuals,
         "summary": summary,
     }
@@ -228,7 +241,7 @@ def main():
         "--config", default="configs/default.yaml", help="Config YAML"
     )
     parser.add_argument(
-        "--eval-dataset", default="data/eval_dataset.hdf5"
+        "--ground-truth", default="artifacts/ground_truth.hdf5"
     )
     parser.add_argument(
         "--predictions", default="artifacts/predictions.hdf5"
@@ -242,31 +255,40 @@ def main():
     repo_root = os.path.dirname(script_dir)
 
     config_path = os.path.join(repo_root, args.config)
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) if os.path.exists(config_path) else {}
+    cfg = {}
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
 
-    eval_path = os.path.join(repo_root, args.eval_dataset)
+    gt_path = os.path.join(repo_root, args.ground_truth)
     pred_path = os.path.join(repo_root, args.predictions)
     output_dir = os.path.join(repo_root, args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load ground truth
-    print("Loading ground truth...")
-    with h5py.File(eval_path, "r") as f:
+    # Load ground truth (produced by run_inference.py)
+    print(f"Loading ground truth from {gt_path}")
+    with h5py.File(gt_path, "r") as f:
         true_flux = f["spectrum_flux"][:]
         ivar = f["spectrum_ivar"][:]
-        spec_mask = f["spectrum_mask"][:]
+        spec_mask = f["spectrum_mask"][:].astype(bool)
         wavelength = f["spectrum_lambda"][:]
         z_spec = f["z_spec"][:]
-        target_types = np.array([t.decode() if isinstance(t, bytes) else t for t in f["target_type"][:]])
+
+    if wavelength.ndim == 2:
+        wavelength = wavelength[0]
 
     # Load predictions
-    print("Loading predictions...")
+    print(f"Loading predictions from {pred_path}")
     with h5py.File(pred_path, "r") as f:
         pred_image_only = f["pred_flux_image_only"][:]
         pred_image_phot = f["pred_flux_image_phot"][:]
 
+    # Stratify by redshift bin (provabgs data is all BGS)
+    strata = classify_redshift_bin(z_spec)
     print(f"Evaluating {len(true_flux)} objects...")
+    unique, counts = np.unique(strata, return_counts=True)
+    for s, c in zip(unique, counts):
+        print(f"  {s}: {c}")
 
     # Evaluate both modes
     poly_degree = cfg.get("poly_degree", 7)
@@ -274,13 +296,13 @@ def main():
 
     results_image = evaluate_mode(
         pred_image_only, true_flux, ivar, spec_mask,
-        wavelength, z_spec, target_types,
+        wavelength, z_spec, strata,
         "Image Only", poly_degree, chi2_threshold,
     )
 
     results_phot = evaluate_mode(
         pred_image_phot, true_flux, ivar, spec_mask,
-        wavelength, z_spec, target_types,
+        wavelength, z_spec, strata,
         "Image + Photometry", poly_degree, chi2_threshold,
     )
 
@@ -309,7 +331,7 @@ def main():
 
     # Save per-object metrics as parquet for the notebook
     per_obj = pd.DataFrame({
-        "target_type": target_types,
+        "z_bin": strata,
         "z_spec": z_spec,
         "chi2_image_only": results_image["chi2_per_object"],
         "chi2_image_phot": results_phot["chi2_per_object"],
@@ -337,5 +359,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import yaml
     main()
