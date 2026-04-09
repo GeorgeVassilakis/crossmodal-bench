@@ -1,0 +1,11 @@
+torch>=2.4.0
+numpy
+scipy
+astropy
+healpy
+h5py
+matplotlib
+pyyaml
+pandas
+polymathic-aion
+desispec
