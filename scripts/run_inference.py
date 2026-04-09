@@ -67,7 +67,7 @@ def run_inference(
 
     # Load model and codec
     print(f"Loading model: {model_name}")
-    model = AION.from_pretrained(model_name, trust_remote_code=True).to(device).eval()
+    model = AION.from_pretrained(model_name).to(device).eval()
     codec = CodecManager(device=device)
 
     images = data["images"]
