@@ -109,6 +109,43 @@ def test_helper_functions_cover_core_benchmark_logic():
     assert np.isnan(module.compute_normalized_skill(1.0, 1.2, 1.0))
 
 
+def test_continuum_r2_tracks_smoothed_continuum_shape():
+    module = load_evaluate_module()
+
+    wavelength = np.linspace(3600.0, 9800.0, 128, dtype=np.float64)
+    x = (wavelength - wavelength.mean()) / wavelength.std()
+    true_cont = 1.5 + 0.2 * x + 0.08 * x**2
+    true_flux = np.stack([true_cont]).astype(np.float32)
+    ivar = np.full_like(true_flux, 25.0, dtype=np.float32)
+    spec_mask = np.zeros_like(true_flux, dtype=bool)
+    z_spec = np.array([0.2], dtype=np.float32)
+
+    pred_good = np.stack([1.2 * true_cont + 0.01 * np.sin(2.0 * x)]).astype(np.float32)
+    pred_bad = np.stack([1.0 - 0.12 * x + 0.03 * x**2]).astype(np.float32)
+
+    good_r2 = module.continuum_r2(
+        pred_good,
+        true_flux,
+        ivar,
+        wavelength,
+        spec_mask,
+        z_spec,
+        poly_degree=5,
+    )[0]
+    bad_r2 = module.continuum_r2(
+        pred_bad,
+        true_flux,
+        ivar,
+        wavelength,
+        spec_mask,
+        z_spec,
+        poly_degree=5,
+    )[0]
+
+    assert good_r2 > 0.95
+    assert bad_r2 < good_r2
+
+
 def test_evaluate_main_writes_metrics_with_oracle_and_baselines(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = load_evaluate_module()
     gt_path, pred_path, oracle_path, config_path = write_fixture_files(tmp_path)

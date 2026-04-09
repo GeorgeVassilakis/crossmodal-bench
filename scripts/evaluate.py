@@ -34,6 +34,7 @@ REST_FRAME_LINES = {
 LINE_MASK_HALFWIDTH_A = 15.0  # mask +/- this many Angstrom around each line
 CAMERA_BOUNDARIES_A = [4500, 5900, 7500]
 PHOTOMETRY_KEYS = ("flux_g", "flux_r", "flux_i", "flux_z")
+CONTINUUM_SHAPE_VARIANCE_FLOOR = 1e-6
 
 
 def save_summary_plots(
@@ -268,34 +269,66 @@ def per_object_chi2(
 def continuum_r2(
     pred: np.ndarray,
     true: np.ndarray,
+    ivar: np.ndarray,
     wavelength: np.ndarray,
     spec_mask: np.ndarray,
     z_spec: np.ndarray,
     poly_degree: int = 7,
 ) -> np.ndarray:
-    """Per-object R^2 of predicted vs true continuum shape. Shape [N]."""
+    """Per-object R^2 of normalized fitted continuum shapes.
+
+    This smooths both the true and predicted spectra with the same weighted
+    polynomial family on line-masked pixels, then compares the resulting
+    normalized continua. That isolates continuum shape from narrow-line and
+    overall-amplitude effects already covered by the other metrics.
+    """
     line_mask = make_line_mask(wavelength, z_spec)
     n_obj = pred.shape[0]
     r2_values = np.full(n_obj, np.nan)
 
     for i in range(n_obj):
-        fit_mask = ~spec_mask[i] & ~line_mask[i]
+        fit_mask = (
+            ~spec_mask[i]
+            & ~line_mask[i]
+            & (ivar[i] > 0)
+            & np.isfinite(true[i])
+            & np.isfinite(pred[i])
+        )
         if fit_mask.sum() < poly_degree + 10:
             continue
 
-        x = wavelength[fit_mask]
-        x_norm = (x - x.mean()) / x.std()
+        x = wavelength[fit_mask].astype(np.float64)
+        weights = ivar[i, fit_mask].astype(np.float64)
+        x_std = x.std()
+        if not np.isfinite(x_std) or x_std == 0:
+            continue
+        x_norm = (x - x.mean()) / x_std
+        fit_degree = min(poly_degree, fit_mask.sum() - 1)
+        if fit_degree < 1:
+            continue
 
         try:
-            true_coeffs = np.polyfit(x_norm, true[i, fit_mask], poly_degree)
+            fit_weights = np.sqrt(weights)
+            true_coeffs = np.polyfit(x_norm, true[i, fit_mask], fit_degree, w=fit_weights)
+            pred_coeffs = np.polyfit(x_norm, pred[i, fit_mask], fit_degree, w=fit_weights)
+
             true_cont = np.polyval(true_coeffs, x_norm)
+            pred_cont = np.polyval(pred_coeffs, x_norm)
 
-            pred_cont = pred[i, fit_mask]
+            true_scale = np.sqrt(np.average(true_cont**2, weights=weights))
+            pred_scale = np.sqrt(np.average(pred_cont**2, weights=weights))
+            if true_scale <= 0 or pred_scale <= 0:
+                continue
 
-            ss_res = np.sum((pred_cont - true_cont) ** 2)
-            ss_tot = np.sum((true_cont - true_cont.mean()) ** 2)
+            true_shape = true_cont / true_scale
+            pred_shape = pred_cont / pred_scale
 
-            if ss_tot > 0:
+            true_shape_mean = np.average(true_shape, weights=weights)
+            ss_res = np.sum(weights * (pred_shape - true_shape) ** 2)
+            ss_tot = np.sum(weights * (true_shape - true_shape_mean) ** 2)
+            weighted_var = ss_tot / np.sum(weights)
+
+            if weighted_var > CONTINUUM_SHAPE_VARIANCE_FLOOR:
                 r2_values[i] = 1.0 - ss_res / ss_tot
         except (np.linalg.LinAlgError, ValueError):
             continue
@@ -397,7 +430,7 @@ def evaluate_mode(
 
     print("  Computing continuum R2...")
     cont_r2_vals = continuum_r2(
-        pred_flux, true_flux, wavelength, combined_mask, z_spec, poly_degree
+        pred_flux, true_flux, ivar, wavelength, combined_mask, z_spec, poly_degree
     )
     print(f"  Median continuum R2: {np.nanmedian(cont_r2_vals):.3f}")
 
