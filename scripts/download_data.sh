@@ -2,9 +2,10 @@
 # Download the pre-built ProVABGS + DESI + Legacy Survey cross-matched dataset.
 # ~3.9 GB, contains 4000 galaxies with images, spectra, and photometry.
 #
-# NOTE: This is DESI EDR/SV3 data that AION-1 was trained on.
-# Use for pipeline validation / proof-of-concept only.
-# For a clean held-out benchmark, swap in DESI DR1 main-survey data.
+# NOTE: This is a small unseen eval set (~4000 objects) used for
+# AION-1 spectrum-generation benchmarking.
+# For an alternate benchmark, see scripts/prepare_data.py for building
+# a DESI DR1 main-survey dataset.
 
 set -euo pipefail
 

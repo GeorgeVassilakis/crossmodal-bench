@@ -4,9 +4,10 @@ Evaluates AION-1's ability to predict DESI galaxy spectra from Legacy Survey
 images alone, using the ProVABGS + DESI + Legacy Survey cross-matched dataset
 (~4000 galaxies with images, spectra, and photometry).
 
-**Note:** The current dataset (`provabgs_desi_ls.hdf5`) uses DESI EDR/SV3 data
-that AION-1 was trained on. This is for pipeline validation only. For a clean
-held-out benchmark, swap in DESI DR1 main-survey data.
+**Note:** The current dataset (`provabgs_desi_ls.hdf5`) is a small unseen eval
+set (~4000 objects) for AION-1 spectrum-generation benchmarking. The
+`prepare_data.py` pipeline can be used to build an alternate benchmark from
+DESI DR1 main-survey data.
 
 ## Quick Start
 
