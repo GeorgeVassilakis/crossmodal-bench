@@ -35,6 +35,12 @@ def load_provabgs_data(path: str) -> dict[str, np.ndarray]:
             "z_spec": np.array(f["provabgs_Z_HP"]),
         }
 
+        if "legacysurvey_image_scale" in f:
+            data["image_scale"] = np.array(f["legacysurvey_image_scale"])
+
+        if "legacysurvey_image_band" in f:
+            data["image_band"] = np.array(f["legacysurvey_image_band"])
+
         # RGB images for visualization (if present)
         if "legacysurvey_image_rgb" in f:
             data["image_rgb"] = np.array(f["legacysurvey_image_rgb"])
@@ -43,8 +49,66 @@ def load_provabgs_data(path: str) -> dict[str, np.ndarray]:
     print(f"  Image shape: {data['images'].shape}")
     print(f"  Spectrum shape: {data['spectrum_flux'].shape}")
     print(f"  Wavelength range: {data['spectrum_lambda'].min():.0f} - {data['spectrum_lambda'].max():.0f} A")
+    if "image_scale" in data:
+        scale = data["image_scale"]
+        print(
+            "  Image scale stats:"
+            f" shape={scale.shape}, dtype={scale.dtype},"
+            f" min={scale.min():.6g}, max={scale.max():.6g}, mean={scale.mean():.6g}"
+        )
 
     return data
+
+
+def generate_spectrum_tokens(
+    model,
+    codec,
+    target_modality,
+    device: str,
+    decoding_steps: int,
+    *modalities,
+) -> dict[str, torch.Tensor]:
+    """Generate spectrum tokens using AION's iterative MaskGIT sampler."""
+    from aion.fourm.generate import (
+        GenerationSampler,
+        build_chained_generation_schedules,
+        init_empty_target_modality,
+        init_full_input_modality,
+    )
+
+    token_dict = codec.encode(*modalities)
+    mod_dict: dict[str, dict[str, torch.Tensor]] = {}
+
+    for token_key, tensor in token_dict.items():
+        mod_dict[token_key] = {"tensor": tensor}
+        init_full_input_modality(mod_dict, model.modality_info, token_key, device)
+
+    init_empty_target_modality(
+        mod_dict,
+        model.modality_info,
+        target_modality.token_key,
+        batch_size=list(token_dict.values())[0].shape[0],
+        num_tokens=target_modality.num_tokens,
+        device=device,
+    )
+
+    schedule = build_chained_generation_schedules(
+        cond_domains=list(token_dict.keys()),
+        target_domains=[target_modality.token_key],
+        tokens_per_target=[target_modality.num_tokens],
+        autoregression_schemes=["maskgit"],
+        decoding_steps=[decoding_steps],
+        token_decoding_schedules=["cosine"],
+        temps=[0.0],
+        temp_schedules=["constant"],
+        cfg_scales=[1.0],
+        cfg_schedules=["constant"],
+        modality_info=model.modality_info,
+    )
+
+    sampler = GenerationSampler(model)
+    generated = sampler.generate(mod_dict, schedule, verbose=False)
+    return {target_modality.token_key: generated[target_modality.token_key]["tensor"]}
 
 
 def run_inference(
@@ -53,6 +117,7 @@ def run_inference(
     model_name: str = "polymathic-ai/aion-base",
     batch_size: int = 32,
     device: str = "cuda",
+    spectrum_decoding_steps: int = 12,
 ):
     from aion import AION
     from aion.codecs import CodecManager
@@ -81,6 +146,7 @@ def run_inference(
     wavelength_tensor = torch.tensor(wavelength, dtype=torch.float32, device=device)
 
     print(f"Running inference on {N} galaxies, batch_size={batch_size}")
+    print(f"Spectrum decoding: MaskGIT, {spectrum_decoding_steps} steps")
 
     # Pre-allocate output arrays
     pred_flux_image_only = np.zeros((N, n_wave), dtype=np.float32)
@@ -106,14 +172,15 @@ def run_inference(
             flux=batch_images,
             bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
         )
-        tokens = codec.encode(image_mod)
-
         with torch.no_grad():
-            logits = model(tokens, target_modality=DESISpectrum)
-
-        pred_tokens = {
-            "tok_spectrum_desi": logits["tok_spectrum_desi"].argmax(dim=-1)
-        }
+            pred_tokens = generate_spectrum_tokens(
+                model,
+                codec,
+                DESISpectrum,
+                device,
+                spectrum_decoding_steps,
+                image_mod,
+            )
 
         wl = wavelength_tensor.unsqueeze(0).expand(B, -1)
         pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
@@ -148,14 +215,19 @@ def run_inference(
         fi = LegacySurveyFluxI(value=torch.tensor(data["flux_i"][start:end], dtype=torch.float32, device=device))
         fz = LegacySurveyFluxZ(value=torch.tensor(data["flux_z"][start:end], dtype=torch.float32, device=device))
 
-        tokens = codec.encode(image_mod, fg, fr, fi, fz)
-
         with torch.no_grad():
-            logits = model(tokens, target_modality=DESISpectrum)
-
-        pred_tokens = {
-            "tok_spectrum_desi": logits["tok_spectrum_desi"].argmax(dim=-1)
-        }
+            pred_tokens = generate_spectrum_tokens(
+                model,
+                codec,
+                DESISpectrum,
+                device,
+                spectrum_decoding_steps,
+                image_mod,
+                fg,
+                fr,
+                fi,
+                fz,
+            )
 
         wl = wavelength_tensor.unsqueeze(0).expand(B, -1)
         pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
@@ -230,6 +302,7 @@ def main():
         model_name=cfg.get("model_name", "polymathic-ai/aion-base"),
         batch_size=cfg.get("batch_size", 32),
         device=cfg.get("device", "cuda"),
+        spectrum_decoding_steps=cfg.get("spectrum_decoding_steps", 12),
     )
 
 
