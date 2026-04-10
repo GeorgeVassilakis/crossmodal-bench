@@ -46,6 +46,11 @@ def write_fixture_files(tmp_path: Path, *, oracle_done: bool = True, preds_done:
         f.create_dataset("spectrum_mask", data=spec_mask)
         f.create_dataset("spectrum_lambda", data=wavelength)
         f.create_dataset("z_spec", data=z_spec)
+        f.create_dataset("targetid", data=np.array([101, 102, 103, 104, 105], dtype=np.int64))
+        f.create_dataset("ra", data=np.array([150.1, 150.2, 150.3, 150.4, 150.5], dtype=np.float32))
+        f.create_dataset("dec", data=np.array([2.1, 2.2, 2.3, 2.4, 2.5], dtype=np.float32))
+        f.create_dataset("f_fiber", data=np.array([0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32))
+        f.create_dataset("fibmag_r", data=np.array([20.1, 20.2, 20.3, 20.4, 20.5], dtype=np.float32))
         f.create_dataset("flux_g", data=np.array([1.0, 1.1, 2.0, 2.1, 5.0], dtype=np.float32))
         f.create_dataset("flux_r", data=np.array([1.2, 1.3, 2.2, 2.3, 5.2], dtype=np.float32))
         f.create_dataset("flux_i", data=np.array([1.4, 1.5, 2.4, 2.5, 5.4], dtype=np.float32))
@@ -55,10 +60,13 @@ def write_fixture_files(tmp_path: Path, *, oracle_done: bool = True, preds_done:
     with h5py.File(pred_path, "w") as f:
         f.create_dataset("wavelength", data=wavelength)
         f.create_dataset("pred_flux_image_only", data=true_flux + 0.08)
+        f.create_dataset("pred_flux_phot_only", data=true_flux + 0.05)
         f.create_dataset("pred_flux_image_phot", data=true_flux + 0.03)
         f.create_dataset("pred_mask_image_only", data=np.zeros_like(spec_mask, dtype=bool))
+        f.create_dataset("pred_mask_phot_only", data=np.zeros_like(spec_mask, dtype=bool))
         f.create_dataset("pred_mask_image_phot", data=np.zeros_like(spec_mask, dtype=bool))
         f.attrs["image_only_done"] = preds_done
+        f.attrs["phot_only_done"] = preds_done
         f.attrs["image_phot_done"] = preds_done
 
     oracle_path = tmp_path / "oracle.hdf5"
@@ -109,6 +117,33 @@ def test_helper_functions_cover_core_benchmark_logic():
     assert np.isnan(module.compute_normalized_skill(1.0, 1.2, 1.0))
 
 
+def test_scale_and_tilt_chi2_capture_calibration_like_errors():
+    module = load_evaluate_module()
+
+    wavelength = np.linspace(3600.0, 9800.0, 32, dtype=np.float64)
+    x = (wavelength - wavelength.mean()) / wavelength.std()
+    true_flux = np.stack([
+        1.5 + 0.25 * x + 0.05 * np.sin(wavelength / 400.0),
+        1.2 - 0.15 * x + 0.04 * np.cos(wavelength / 350.0),
+    ]).astype(np.float32)
+    ivar = np.full_like(true_flux, 9.0, dtype=np.float32)
+    spec_mask = np.zeros_like(true_flux, dtype=bool)
+
+    pred_scaled = 1.35 * true_flux
+    chi2_raw_scaled = module.per_object_chi2(pred_scaled, true_flux, ivar, spec_mask)
+    chi2_scale_scaled, scale_factors = module.per_object_scale_chi2(pred_scaled, true_flux, ivar, spec_mask)
+    np.testing.assert_allclose(scale_factors, np.full(2, 1.0 / 1.35), rtol=1e-5, atol=1e-5)
+    assert np.all(chi2_scale_scaled < chi2_raw_scaled * 1e-4)
+
+    pred_tilted = (true_flux / (1.15 + 0.12 * x[None, :])).astype(np.float32)
+    chi2_raw_tilted = module.per_object_chi2(pred_tilted, true_flux, ivar, spec_mask)
+    chi2_scale_tilted, _ = module.per_object_scale_chi2(pred_tilted, true_flux, ivar, spec_mask)
+    chi2_tilt_tilted, tilt_params = module.per_object_tilt_chi2(pred_tilted, true_flux, ivar, spec_mask, wavelength)
+    assert np.all(np.isfinite(tilt_params))
+    assert np.all(chi2_tilt_tilted < chi2_scale_tilted)
+    assert np.all(chi2_tilt_tilted < chi2_raw_tilted * 1e-4)
+
+
 def test_continuum_r2_tracks_smoothed_continuum_shape():
     module = load_evaluate_module()
 
@@ -150,8 +185,11 @@ def test_evaluate_main_writes_metrics_with_oracle_and_baselines(tmp_path: Path, 
     module = load_evaluate_module()
     gt_path, pred_path, oracle_path, config_path = write_fixture_files(tmp_path)
     output_dir = tmp_path / "artifacts"
+    parquet_capture: dict[str, object] = {}
 
     def fake_to_parquet(self, path, index=False):
+        parquet_capture["columns"] = list(self.columns)
+        parquet_capture["frame"] = self.copy()
         Path(path).write_text("parquet stub\n")
 
     def fake_save_summary_plots(**kwargs):
@@ -176,23 +214,43 @@ def test_evaluate_main_writes_metrics_with_oracle_and_baselines(tmp_path: Path, 
 
     metrics = json.loads((output_dir / "metrics.json").read_text())
     assert "image_only" in metrics
+    assert "phot_only" in metrics
     assert "image_phot" in metrics
     assert "oracle" in metrics
     assert "baseline_mean" in metrics
     assert "baseline_phot_nn" in metrics
     assert "normalized_skill" in metrics
     assert metrics["oracle"]["median_chi2"] < metrics["image_only"]["median_chi2"]
+    assert metrics["image_phot"]["median_chi2"] < metrics["phot_only"]["median_chi2"]
     assert metrics["image_phot"]["median_chi2"] < metrics["image_only"]["median_chi2"]
     assert metrics["baseline_phot_nn"]["median_chi2"] <= metrics["baseline_mean"]["median_chi2"]
+    assert metrics["image_only"]["median_chi2_scale"] <= metrics["image_only"]["median_chi2"]
+    assert metrics["image_only"]["median_chi2_tilt"] <= metrics["image_only"]["median_chi2_scale"]
     assert metrics["normalized_skill"]["rows"]
+    assert {row["method"] for row in metrics["normalized_skill"]["rows"]} >= {"image_only", "phot_only", "image_phot"}
 
     per_wavelength = np.load(output_dir / "per_wavelength.npz")
+    assert "chi2_phot_only" in per_wavelength.files
     assert "chi2_oracle" in per_wavelength.files
     assert "chi2_baseline_mean" in per_wavelength.files
     assert "chi2_baseline_phot_nn" in per_wavelength.files
 
     assert (output_dir / "metrics_per_object.parquet").exists()
     assert (output_dir / "plots_stub.txt").exists()
+    assert parquet_capture["frame"] is not None
+    assert {
+        "targetid",
+        "ra",
+        "dec",
+        "f_fiber",
+        "fibmag_r",
+        "chi2_phot_only",
+        "chi2_scale_image_only",
+        "chi2_tilt_image_only",
+        "scale_factor_phot_only",
+        "tilt_intercept_image_phot",
+        "tilt_slope_image_phot",
+    }.issubset(set(parquet_capture["columns"]))
 
 
 def test_evaluate_main_rejects_incomplete_oracle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

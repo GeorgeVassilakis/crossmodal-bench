@@ -1,7 +1,8 @@
-"""Run AION-1 cross-modal inference: predict DESI spectra from Legacy Survey images.
+"""Run AION-1 cross-modal inference: predict DESI spectra from Legacy Survey inputs.
 
-Reads data/provabgs_desi_ls.hdf5 (or custom eval HDF5), runs inference in two
-modes (image-only and image+photometry), saves predictions to artifacts/predictions.hdf5.
+Reads data/provabgs_desi_ls.hdf5 (or custom eval HDF5), runs inference in three
+modes (image-only, photometry-only, and image+photometry), saves predictions to
+artifacts/predictions.hdf5.
 """
 
 from __future__ import annotations
@@ -34,6 +35,19 @@ def load_provabgs_data(path: str) -> dict[str, np.ndarray]:
             "flux_z": np.array(f["legacysurvey_FLUX_Z"]),
             "z_spec": np.array(f["provabgs_Z_HP"]),
         }
+
+        optional_fields = {
+            "targetid": ("targetid", "provabgs_TARGETID", "TARGETID"),
+            "ra": ("ra", "provabgs_ra", "legacysurvey_ra", "desi_ra"),
+            "dec": ("dec", "provabgs_dec", "legacysurvey_dec", "desi_dec"),
+            "f_fiber": ("f_fiber", "provabgs_f_fiber"),
+            "fibmag_r": ("fibmag_r", "provabgs_FIBMAG_R"),
+        }
+        for output_key, candidate_keys in optional_fields.items():
+            for candidate in candidate_keys:
+                if candidate in f:
+                    data[output_key] = np.array(f[candidate])
+                    break
 
         if "legacysurvey_image_scale" in f:
             data["image_scale"] = np.array(f["legacysurvey_image_scale"])
@@ -122,30 +136,54 @@ def make_batched_scalar(values: np.ndarray, start: int, end: int, device: str) -
     ).reshape(-1, 1)
 
 
+def build_photometry_modalities(data: dict[str, np.ndarray], start: int, end: int, device: str):
+    """Build scalar photometry modalities for the requested batch."""
+    from aion.modalities import LegacySurveyFluxG, LegacySurveyFluxI, LegacySurveyFluxR, LegacySurveyFluxZ
+
+    return (
+        LegacySurveyFluxG(value=make_batched_scalar(data["flux_g"], start, end, device)),
+        LegacySurveyFluxR(value=make_batched_scalar(data["flux_r"], start, end, device)),
+        LegacySurveyFluxI(value=make_batched_scalar(data["flux_i"], start, end, device)),
+        LegacySurveyFluxZ(value=make_batched_scalar(data["flux_z"], start, end, device)),
+    )
+
+
 def save_ground_truth(
     data: dict[str, np.ndarray],
     gt_path: str,
     wavelength: np.ndarray,
 ) -> None:
     """Write ground truth once so evaluation can proceed independently of inference restarts."""
-    if os.path.exists(gt_path):
-        return
-
     os.makedirs(os.path.dirname(gt_path), exist_ok=True)
-    print(f"Saving ground truth to {gt_path}")
-    with h5py.File(gt_path, "w") as f:
-        f.create_dataset("spectrum_flux", data=data["spectrum_flux"])
-        f.create_dataset("spectrum_ivar", data=data["spectrum_ivar"])
-        f.create_dataset("spectrum_mask", data=data["spectrum_mask"])
-        f.create_dataset("spectrum_lambda", data=wavelength)
-        f.create_dataset("z_spec", data=data["z_spec"])
+
+    def ensure_dataset(f: h5py.File, name: str, dataset_data: np.ndarray, **kwargs) -> None:
+        if name in f:
+            return
+        f.create_dataset(name, data=dataset_data, **kwargs)
+
+    mode = "a" if os.path.exists(gt_path) else "w"
+    if mode == "w":
+        print(f"Saving ground truth to {gt_path}")
+    else:
+        print(f"Ensuring ground truth metadata in {gt_path}")
+
+    with h5py.File(gt_path, mode) as f:
+        ensure_dataset(f, "spectrum_flux", data["spectrum_flux"])
+        ensure_dataset(f, "spectrum_ivar", data["spectrum_ivar"])
+        ensure_dataset(f, "spectrum_mask", data["spectrum_mask"])
+        ensure_dataset(f, "spectrum_lambda", wavelength)
+        ensure_dataset(f, "z_spec", data["z_spec"])
         if "image_rgb" in data:
-            f.create_dataset("image_rgb", data=data["image_rgb"])
-        f.create_dataset("images", data=data["images"], compression="gzip", compression_opts=1)
-        f.create_dataset("flux_g", data=data["flux_g"])
-        f.create_dataset("flux_r", data=data["flux_r"])
-        f.create_dataset("flux_i", data=data["flux_i"])
-        f.create_dataset("flux_z", data=data["flux_z"])
+            ensure_dataset(f, "image_rgb", data["image_rgb"])
+        ensure_dataset(f, "images", data["images"], compression="gzip", compression_opts=1)
+        ensure_dataset(f, "flux_g", data["flux_g"])
+        ensure_dataset(f, "flux_r", data["flux_r"])
+        ensure_dataset(f, "flux_i", data["flux_i"])
+        ensure_dataset(f, "flux_z", data["flux_z"])
+
+        for key in ["targetid", "ra", "dec", "f_fiber", "fibmag_r"]:
+            if key in data:
+                ensure_dataset(f, key, data[key])
 
 
 def prepare_prediction_store(
@@ -174,8 +212,10 @@ def prepare_prediction_store(
 
     for name, dtype in [
         ("pred_flux_image_only", np.float32),
+        ("pred_flux_phot_only", np.float32),
         ("pred_flux_image_phot", np.float32),
         ("pred_mask_image_only", np.bool_),
+        ("pred_mask_phot_only", np.bool_),
         ("pred_mask_image_phot", np.bool_),
         ("pred_mask", np.bool_),
     ]:
@@ -211,10 +251,14 @@ def prepare_prediction_store(
         f.attrs["image_only_next_index"] = 0
     if "image_phot_next_index" not in f.attrs:
         f.attrs["image_phot_next_index"] = 0
+    if "phot_only_next_index" not in f.attrs:
+        f.attrs["phot_only_next_index"] = 0
     if "image_only_done" not in f.attrs:
         f.attrs["image_only_done"] = False
     if "image_phot_done" not in f.attrs:
         f.attrs["image_phot_done"] = False
+    if "phot_only_done" not in f.attrs:
+        f.attrs["phot_only_done"] = False
     f.flush()
     return f
 
@@ -256,6 +300,18 @@ def run_inference(
         model=model,
         cond_domains=[
             LegacySurveyImage.token_key,
+            LegacySurveyFluxG.token_key,
+            LegacySurveyFluxR.token_key,
+            LegacySurveyFluxI.token_key,
+            LegacySurveyFluxZ.token_key,
+        ],
+        target_domain=DESISpectrum.token_key,
+        target_num_tokens=DESISpectrum.num_tokens,
+        decoding_steps=spectrum_decoding_steps,
+    )
+    phot_only_schedule = build_maskgit_schedule(
+        model=model,
+        cond_domains=[
             LegacySurveyFluxG.token_key,
             LegacySurveyFluxR.token_key,
             LegacySurveyFluxI.token_key,
@@ -344,14 +400,64 @@ def run_inference(
         t1 = time.time()
         print(f"  Image-only inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
 
-    # ---------- Mode 2: Image + photometry ----------
+    # ---------- Mode 2: Photometry only ----------
+    phot_only_done = bool(pred_store.attrs["phot_only_done"])
+    phot_only_start = int(pred_store.attrs["phot_only_next_index"])
+    if phot_only_done:
+        print("\n--- Mode 2: Photometry only ---")
+        print("  Checkpoint complete, skipping.")
+    else:
+        print("\n--- Mode 2: Photometry only ---")
+        if phot_only_start > 0:
+            print(f"  Resuming from object {phot_only_start}/{N}")
+        t0 = time.time()
+
+        for start in range(phot_only_start, N, batch_size):
+            end = min(start + batch_size, N)
+            B = end - start
+
+            if start % (batch_size * 10) == 0:
+                print(f"  Batch {start // batch_size + 1}/{(N + batch_size - 1) // batch_size}")
+
+            fg, fr, fi, fz = build_photometry_modalities(data, start, end, device)
+
+            with torch.no_grad():
+                pred_tokens = generate_spectrum_tokens(
+                    codec,
+                    sampler,
+                    phot_only_schedule,
+                    DESISpectrum.token_key,
+                    DESISpectrum.num_tokens,
+                    fg,
+                    fr,
+                    fi,
+                    fz,
+                )
+
+            wl = wavelength_tensor.unsqueeze(0).expand(B, -1).contiguous()
+            pred_spectrum = codec.decode(pred_tokens, DESISpectrum, wavelength=wl)
+            pred_flux = pred_spectrum.flux.cpu().numpy()
+            pred_mask = pred_spectrum.mask.cpu().numpy()
+
+            pred_store["pred_flux_phot_only"][start:end] = pred_flux
+            pred_store["pred_mask_phot_only"][start:end] = pred_mask
+            pred_store.attrs["phot_only_next_index"] = end
+            pred_store.flush()
+
+        pred_store.attrs["phot_only_next_index"] = N
+        pred_store.attrs["phot_only_done"] = True
+        pred_store.flush()
+        t1 = time.time()
+        print(f"  Phot-only inference: {t1 - t0:.1f}s ({(t1 - t0) / N * 1000:.1f}ms/galaxy)")
+
+    # ---------- Mode 3: Image + photometry ----------
     image_phot_done = bool(pred_store.attrs["image_phot_done"])
     image_phot_start = int(pred_store.attrs["image_phot_next_index"])
     if image_phot_done:
-        print("\n--- Mode 2: Image + photometry ---")
+        print("\n--- Mode 3: Image + photometry ---")
         print("  Checkpoint complete, skipping.")
     else:
-        print("\n--- Mode 2: Image + photometry ---")
+        print("\n--- Mode 3: Image + photometry ---")
         if image_phot_start > 0:
             print(f"  Resuming from object {image_phot_start}/{N}")
         t0 = time.time()
@@ -371,10 +477,7 @@ def run_inference(
                 flux=batch_images,
                 bands=["DES-G", "DES-R", "DES-I", "DES-Z"],
             )
-            fg = LegacySurveyFluxG(value=make_batched_scalar(data["flux_g"], start, end, device))
-            fr = LegacySurveyFluxR(value=make_batched_scalar(data["flux_r"], start, end, device))
-            fi = LegacySurveyFluxI(value=make_batched_scalar(data["flux_i"], start, end, device))
-            fz = LegacySurveyFluxZ(value=make_batched_scalar(data["flux_z"], start, end, device))
+            fg, fr, fi, fz = build_photometry_modalities(data, start, end, device)
 
             with torch.no_grad():
                 pred_tokens = generate_spectrum_tokens(

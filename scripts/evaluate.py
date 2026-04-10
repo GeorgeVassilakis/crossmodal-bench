@@ -35,6 +35,7 @@ LINE_MASK_HALFWIDTH_A = 15.0  # mask +/- this many Angstrom around each line
 CAMERA_BOUNDARIES_A = [4500, 5900, 7500]
 PHOTOMETRY_KEYS = ("flux_g", "flux_r", "flux_i", "flux_z")
 CONTINUUM_SHAPE_VARIANCE_FLOOR = 1e-6
+PER_OBJECT_METADATA_KEYS = ("targetid", "ra", "dec", "f_fiber", "fibmag_r")
 
 
 def save_summary_plots(
@@ -55,6 +56,7 @@ def save_summary_plots(
 
     method_styles = {
         "image_only": {"color": "steelblue"},
+        "phot_only": {"color": "goldenrod"},
         "image_phot": {"color": "darkorange"},
         "oracle": {"color": "seagreen"},
         "baseline_mean": {"color": "firebrick"},
@@ -116,7 +118,7 @@ def save_summary_plots(
     plt.close(fig)
 
     # Plot 2: Per-object chi2 histograms by redshift bin
-    histogram_methods = [method for method in plot_methods if method["key"] in {"image_only", "image_phot"}]
+    histogram_methods = [method for method in plot_methods if method["key"] in {"image_only", "phot_only", "image_phot"}]
     if len(histogram_methods) < 2:
         histogram_methods = plot_methods[: min(2, len(plot_methods))]
     z_bin_list = sorted(set(per_obj["z_bin"].values))
@@ -264,6 +266,88 @@ def per_object_chi2(
     residual_sq = (pred - true) ** 2 * ivar
     residual_sq[~valid] = np.nan
     return np.nanmean(residual_sq, axis=1)
+
+
+def fit_scale_factors(
+    pred: np.ndarray,
+    true: np.ndarray,
+    ivar: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Fit a single multiplicative scale per object."""
+    valid = ~mask & (ivar > 0)
+    weighted_pred_sq = np.where(valid, ivar * pred * pred, 0.0)
+    weighted_pred_true = np.where(valid, ivar * pred * true, 0.0)
+
+    numerator = weighted_pred_true.sum(axis=1)
+    denominator = weighted_pred_sq.sum(axis=1)
+
+    scale = np.full(pred.shape[0], np.nan, dtype=np.float64)
+    np.divide(numerator, denominator, out=scale, where=denominator > 0)
+    return scale
+
+
+def per_object_scale_chi2(
+    pred: np.ndarray,
+    true: np.ndarray,
+    ivar: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduced chi2 per object after best-fit scalar renormalization."""
+    scale = fit_scale_factors(pred, true, ivar, mask)
+    scaled_pred = pred * scale[:, None]
+    return per_object_chi2(scaled_pred, true, ivar, mask), scale
+
+
+def fit_tilt_parameters(
+    pred: np.ndarray,
+    true: np.ndarray,
+    ivar: np.ndarray,
+    mask: np.ndarray,
+    wavelength: np.ndarray,
+) -> np.ndarray:
+    """Fit multiplicative scale+tilt parameters per object."""
+    x = wavelength.astype(np.float64)
+    x_std = x.std()
+    if not np.isfinite(x_std) or x_std == 0:
+        raise ValueError("Wavelength grid has zero or invalid standard deviation")
+    x = (x - x.mean()) / x_std
+
+    valid = ~mask & (ivar > 0)
+    w = np.where(valid, ivar, 0.0)
+    px = pred * x[None, :]
+
+    s00 = np.sum(w * pred * pred, axis=1)
+    s01 = np.sum(w * pred * px, axis=1)
+    s11 = np.sum(w * px * px, axis=1)
+    b0 = np.sum(w * pred * true, axis=1)
+    b1 = np.sum(w * px * true, axis=1)
+
+    det = s00 * s11 - s01 * s01
+    params = np.full((pred.shape[0], 2), np.nan, dtype=np.float64)
+    good = det > 0
+    params[good, 0] = (b0[good] * s11[good] - b1[good] * s01[good]) / det[good]
+    params[good, 1] = (s00[good] * b1[good] - s01[good] * b0[good]) / det[good]
+
+    fallback = ~good & (s00 > 0)
+    params[fallback, 0] = b0[fallback] / s00[fallback]
+    params[fallback, 1] = 0.0
+    return params
+
+
+def per_object_tilt_chi2(
+    pred: np.ndarray,
+    true: np.ndarray,
+    ivar: np.ndarray,
+    mask: np.ndarray,
+    wavelength: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduced chi2 per object after best-fit multiplicative scale+tilt correction."""
+    params = fit_tilt_parameters(pred, true, ivar, mask, wavelength)
+    x = wavelength.astype(np.float64)
+    x = (x - x.mean()) / x.std()
+    tilted_pred = pred * (params[:, [0]] + params[:, [1]] * x[None, :])
+    return per_object_chi2(tilted_pred, true, ivar, mask), params
 
 
 def continuum_r2(
@@ -424,9 +508,13 @@ def evaluate_mode(
     chi2_lam = per_wavelength_chi2(pred_flux, true_flux, ivar, combined_mask)
     print(f"  Median per-wavelength chi2: {np.nanmedian(chi2_lam):.3f}")
 
-    chi2_obj = per_object_chi2(pred_flux, true_flux, ivar, combined_mask)
-    print(f"  Median per-object chi2: {np.nanmedian(chi2_obj):.3f}")
-    print(f"  Fraction chi2 < {chi2_threshold}: {np.nanmean(chi2_obj < chi2_threshold):.3f}")
+    chi2_obj_raw = per_object_chi2(pred_flux, true_flux, ivar, combined_mask)
+    chi2_obj_scale, scale_factors = per_object_scale_chi2(pred_flux, true_flux, ivar, combined_mask)
+    chi2_obj_tilt, tilt_params = per_object_tilt_chi2(pred_flux, true_flux, ivar, combined_mask, wavelength)
+    print(f"  Median per-object chi2 (raw): {np.nanmedian(chi2_obj_raw):.3f}")
+    print(f"  Median per-object chi2 (scale-renorm): {np.nanmedian(chi2_obj_scale):.3f}")
+    print(f"  Median per-object chi2 (tilt-renorm): {np.nanmedian(chi2_obj_tilt):.3f}")
+    print(f"  Fraction chi2 < {chi2_threshold}: {np.nanmean(chi2_obj_raw < chi2_threshold):.3f}")
 
     print("  Computing continuum R2...")
     cont_r2_vals = continuum_r2(
@@ -437,15 +525,25 @@ def evaluate_mode(
     residuals = residual_analysis(pred_flux, true_flux, ivar, combined_mask)
     print(f"  Mean normalized residual (bias): {np.nanmean(residuals['mean_norm_residual']):.4f}")
 
-    summary = stratified_summary(chi2_obj, cont_r2_vals, strata, chi2_threshold)
-    print(f"\n  Stratified summary:\n{summary.to_string(index=False)}")
+    summary_raw = stratified_summary(chi2_obj_raw, cont_r2_vals, strata, chi2_threshold)
+    summary_scale = stratified_summary(chi2_obj_scale, cont_r2_vals, strata, chi2_threshold)
+    summary_tilt = stratified_summary(chi2_obj_tilt, cont_r2_vals, strata, chi2_threshold)
+    print(f"\n  Stratified summary (raw chi2):\n{summary_raw.to_string(index=False)}")
 
     return {
         "chi2_per_wavelength": chi2_lam,
-        "chi2_per_object": chi2_obj,
+        "chi2_per_object": chi2_obj_raw,
+        "chi2_per_object_raw": chi2_obj_raw,
+        "chi2_per_object_scale": chi2_obj_scale,
+        "chi2_per_object_tilt": chi2_obj_tilt,
+        "scale_factors": scale_factors,
+        "tilt_params": tilt_params,
         "continuum_r2": cont_r2_vals,
         "residuals": residuals,
-        "summary": summary,
+        "summary": summary_raw,
+        "summary_raw": summary_raw,
+        "summary_scale": summary_scale,
+        "summary_tilt": summary_tilt,
     }
 
 
@@ -524,11 +622,19 @@ def build_photometry_nn_baseline(
 def metrics_dict_from_results(results: dict, chi2_threshold: float) -> dict:
     """Convert an evaluation result bundle into a JSON-serializable summary."""
     return {
-        "median_chi2": float(np.nanmedian(results["chi2_per_object"])),
-        "mean_chi2": float(np.nanmean(results["chi2_per_object"])),
-        "frac_good": float(np.nanmean(results["chi2_per_object"] < chi2_threshold)),
+        "median_chi2": float(np.nanmedian(results["chi2_per_object_raw"])),
+        "mean_chi2": float(np.nanmean(results["chi2_per_object_raw"])),
+        "frac_good": float(np.nanmean(results["chi2_per_object_raw"] < chi2_threshold)),
+        "median_chi2_scale": float(np.nanmedian(results["chi2_per_object_scale"])),
+        "mean_chi2_scale": float(np.nanmean(results["chi2_per_object_scale"])),
+        "frac_good_scale": float(np.nanmean(results["chi2_per_object_scale"] < chi2_threshold)),
+        "median_chi2_tilt": float(np.nanmedian(results["chi2_per_object_tilt"])),
+        "mean_chi2_tilt": float(np.nanmean(results["chi2_per_object_tilt"])),
+        "frac_good_tilt": float(np.nanmean(results["chi2_per_object_tilt"] < chi2_threshold)),
         "median_continuum_r2": float(np.nanmedian(results["continuum_r2"])),
-        "summary": results["summary"].to_dict(orient="records"),
+        "summary": results["summary_raw"].to_dict(orient="records"),
+        "summary_scale": results["summary_scale"].to_dict(orient="records"),
+        "summary_tilt": results["summary_tilt"].to_dict(orient="records"),
     }
 
 
@@ -646,6 +752,9 @@ def main():
         photometry = {
             key: f[key][:] for key in PHOTOMETRY_KEYS if key in f
         }
+        per_object_metadata = {
+            key: f[key][:] for key in PER_OBJECT_METADATA_KEYS if key in f
+        }
 
     if wavelength.ndim == 2:
         wavelength = wavelength[0]
@@ -661,17 +770,27 @@ def main():
             raise RuntimeError("Image-only predictions are incomplete; rerun inference before evaluation.")
         if "image_phot_done" in f.attrs and not bool(f.attrs["image_phot_done"]):
             raise RuntimeError("Image+phot predictions are incomplete; rerun inference before evaluation.")
+        if "phot_only_done" in f.attrs and not bool(f.attrs["phot_only_done"]):
+            raise RuntimeError("Phot-only predictions are incomplete; rerun inference before evaluation.")
         if "wavelength" in f:
             validate_wavelength_grid("predictions", f["wavelength"][:], wavelength)
 
         pred_image_only = f["pred_flux_image_only"][:]
         pred_image_phot = f["pred_flux_image_phot"][:]
+        pred_phot_only = f["pred_flux_phot_only"][:] if "pred_flux_phot_only" in f else None
         if "pred_mask_image_only" in f:
             pred_mask_image_only = f["pred_mask_image_only"][:].astype(bool)
         elif "pred_mask" in f:
             pred_mask_image_only = f["pred_mask"][:].astype(bool)
         else:
             pred_mask_image_only = np.zeros_like(spec_mask, dtype=bool)
+
+        if "pred_mask_phot_only" in f:
+            pred_mask_phot_only = f["pred_mask_phot_only"][:].astype(bool)
+        elif pred_phot_only is not None:
+            pred_mask_phot_only = np.zeros_like(spec_mask, dtype=bool)
+        else:
+            pred_mask_phot_only = None
 
         if "pred_mask_image_phot" in f:
             pred_mask_image_phot = f["pred_mask_image_phot"][:].astype(bool)
@@ -684,6 +803,9 @@ def main():
     validate_array_shape("pred_flux_image_phot", pred_image_phot, expected_shape)
     validate_array_shape("pred_mask_image_only", pred_mask_image_only, expected_shape)
     validate_array_shape("pred_mask_image_phot", pred_mask_image_phot, expected_shape)
+    if pred_phot_only is not None:
+        validate_array_shape("pred_flux_phot_only", pred_phot_only, expected_shape)
+        validate_array_shape("pred_mask_phot_only", pred_mask_phot_only, expected_shape)
 
     method_specs.extend([
         {
@@ -693,12 +815,19 @@ def main():
             "pred_mask": pred_mask_image_only,
         },
         {
+            "key": "phot_only",
+            "display_name": "Photometry Only",
+            "pred_flux": pred_phot_only,
+            "pred_mask": pred_mask_phot_only,
+        } if pred_phot_only is not None else None,
+        {
             "key": "image_phot",
             "display_name": "Image + Photometry",
             "pred_flux": pred_image_phot,
             "pred_mask": pred_mask_image_phot,
         },
     ])
+    method_specs = [spec for spec in method_specs if spec is not None]
 
     if os.path.exists(oracle_path):
         print(f"Loading oracle from {oracle_path}")
@@ -798,15 +927,23 @@ def main():
         "z_bin": strata,
         "z_spec": z_spec,
     })
+    for key, values in per_object_metadata.items():
+        per_obj[key] = values
     for spec in method_specs:
         key = spec["key"]
-        per_obj[f"chi2_{key}"] = results_by_key[key]["chi2_per_object"]
+        per_obj[f"chi2_{key}"] = results_by_key[key]["chi2_per_object_raw"]
+        per_obj[f"chi2_scale_{key}"] = results_by_key[key]["chi2_per_object_scale"]
+        per_obj[f"chi2_tilt_{key}"] = results_by_key[key]["chi2_per_object_tilt"]
         per_obj[f"cont_r2_{key}"] = results_by_key[key]["continuum_r2"]
+        if key in {"image_only", "phot_only", "image_phot"}:
+            per_obj[f"scale_factor_{key}"] = results_by_key[key]["scale_factors"]
+            per_obj[f"tilt_intercept_{key}"] = results_by_key[key]["tilt_params"][:, 0]
+            per_obj[f"tilt_slope_{key}"] = results_by_key[key]["tilt_params"][:, 1]
     if phot_nn_index is not None:
         per_obj["phot_nn_index"] = phot_nn_index
 
     baseline_keys = [spec["key"] for spec in method_specs if str(spec["key"]).startswith("baseline_")]
-    model_keys = [key for key in ["image_only", "image_phot"] if key in results_by_key]
+    model_keys = [key for key in ["image_only", "phot_only", "image_phot"] if key in results_by_key]
     skill_table = build_normalized_skill_table(
         per_obj=per_obj,
         strata=strata,
