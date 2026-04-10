@@ -525,6 +525,10 @@ def main():
     parser.add_argument(
         "--output", default="artifacts/predictions.hdf5", help="Output predictions HDF5"
     )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Override batch size from config for this run",
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -544,7 +548,7 @@ def main():
         data=data,
         output_path=output_path,
         model_name=cfg.get("model_name", "polymathic-ai/aion-base"),
-        batch_size=cfg.get("batch_size", 32),
+        batch_size=args.batch_size if args.batch_size is not None else cfg.get("batch_size", 32),
         device=cfg.get("device", "cuda"),
         spectrum_decoding_steps=cfg.get("spectrum_decoding_steps", 12),
     )
